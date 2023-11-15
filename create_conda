@@ -1,0 +1,312 @@
+#!/bin/bash -e
+
+##########################################################
+
+# GLOBAL VARIABLES ---------------------------------------
+MENU_BACKTITLE="MINICONDA + SINGULARITY OVERLAY ENVIRONMENT"
+MENU_WIDTH=80
+
+OS="/scratch/work/public/singularity/cuda11.2.2-cudnn8-devel-ubuntu20.04.sif"
+INSTALL_PATH=${HOME}
+OVERLAY_FILE="_temp_overlay.ext3"
+
+BLUE='\033[0;34m'
+RED='\033[0;31m'
+NC='\033[0m' # No Color
+
+##########################################################
+
+# ----------------------------------------------------------------------
+#
+# ----------------------------------------------------------------------
+main () {
+  # Ask for overlay from /scratch/work/public/singularity
+  select_overlay "/scratch/work/public/overlay-fs-ext3"
+
+  # Unzip the selected overlay to INSTALL_PATH
+  unzip_overlay
+
+  # Download & install miniconda latest into OVERLAY_FILE
+  download_install_miniconda "https://repo.continuum.io/miniconda/Miniconda3-latest-Linux-x86_64.sh"
+
+  # Create environment file, ext3/env.sh
+  create_env_file
+
+  # Ask if environment.yml present. If so, set REQUIREMENTS and extract VENV_NAME
+  check_if_requirements_file_exists
+
+  # Ask for VENV_NAME - default to extracted name in REQUIREMENTS yml
+  get_venv_name
+
+  # Install virtual environment
+  install_virtual_environment
+
+  # Print "Getting Started" instructions
+  #print_getting_started_instructions
+}
+
+# ----------------------------------------------------------------------
+#
+# ----------------------------------------------------------------------
+install_virtual_environment () {
+  echo -e "\n${BLUE}[INSTALLING VIRTUAL ENVIRONMENT]${NC}"
+
+  if ! [ -z "$REQUIREMENTS" ]; then
+    echo -e "conda env create -p /ext3/$VENV_NAME --file $REQUIREMENTS\n"
+    singularity_exec "source /ext3/env.sh; conda env create -p /ext3/$VENV_NAME --file $REQUIREMENTS"
+  else
+    echo -e "conda env create -p /ext3/$VENV_NAME --file $REQUIREMENTS\n"
+    singularity_exec "source /ext3/env.sh; conda create -p /ext3/$VENV_NAME -yq"
+  fi
+
+  singularity_exec "echo \"conda activate /ext3/$VENV_NAME\" >> /ext3/env.sh"
+
+  mv $INSTALL_PATH/$OVERLAY_FILE $INSTALL_PATH/$VENV_NAME.ext3
+  OVERLAY_FILE=$VENV_NAME.ext3
+
+  singularity_exec "source /ext3/env.sh; conda install ipykernel -yq"
+}
+
+
+# ----------------------------------------------------------------------
+#
+# ----------------------------------------------------------------------
+get_venv_name () {
+  MENU_TEXT="Enter the name of your virtual env. Valid characters are A-Z a-z 0-9 . _ -.\n\nOverlay will be created in your home directory."
+
+  VENV_DEFAULT=${VENV:-my_virtualenv}
+  while true; do
+    VENV_NAME=$(whiptail --backtitle "$MENU_BACKTITLE" --inputbox \
+      "$MENU_TEXT" \
+      10 $MENU_WIDTH \
+      $VENV_DEFAULT \
+      3>&1 1>&2 2>&3
+    )
+    check_cancelled
+
+    if ! [[ $VENV_NAME =~ ^[0-9a-zA-Z._-]+$ ]]; then
+      whiptail --backtitle "$MENU_BACKTITLE" --msgbox \
+        "ERROR: Invalid filename $VENV_NAME character. Valid characters are A-Z a-z 0-9 . _ -. " \
+        10 $MENU_WIDTH
+    elif [ -f "$INSTALL_PATH/$VENV_NAME.ext3" ]; then
+      whiptail --backtitle "$MENU_BACKTITLE" --msgbox \
+        "ERROR: $INSTALL_PATH/$VENV_NAME.ext3 already exists. Please choose another filename." \
+        10 $MENU_WIDTH
+    elif [[ $VENV_NAME =~ ^[0-9a-zA-Z._-]+$ ]] && ! [ -f "$INSTALL_PATH/$VENV_NAME.ext3" ]; then
+      break
+    fi
+  done
+}
+
+# ----------------------------------------------------------------------
+# Using a TUI, ask the user to select a overlay file
+#
+# Arguments:
+#   1   Full path to overlay template files
+# ----------------------------------------------------------------------
+select_overlay () {
+  MENU_TITLE="OVERLAY SELECTION"
+  MENU_TEXT="Select an overlay file that has the required space and number of files"
+
+  SRC_OVERLAY_PATH="$1"
+
+  # Get a sorted subset of ext3.gz files that are >= to 5GB into OVERLAY_FILES array
+  OVERLAY_FILES=()
+  for item in $(ls $SRC_OVERLAY_PATH/*ext3.gz | egrep -v 'overlay-[0-4][\.G]' | sort -V); do
+    OVERLAY_FILES+=( "$(basename $item)" "" OFF )
+  done
+
+  # Based on the number of ext3.gz dynamically set MENU_HEIGHT
+  MENU_HEIGHT=$(ls $SRC_OVERLAY_PATH/*ext3.gz | egrep -v 'overlay-[0-4][\.G]' | wc -l)
+
+  while [ -z "$SRC_OVERLAY" ]; do
+    SRC_OVERLAY=$(whiptail --backtitle "$MENU_BACKTITLE" --title "$MENU_TITLE" --radiolist \
+      "$MENU_TEXT" \
+      $(expr $MENU_HEIGHT + 8) $MENU_WIDTH $MENU_HEIGHT \
+      "${OVERLAY_FILES[@]}" \
+      3>&1 1>&2 2>&3
+    )
+
+    check_cancelled
+  done
+}
+
+# ----------------------------------------------------------------------
+# Downloads & Installs the latest miniconda into overlay.
+# Once complete deletes the installation file.
+#
+# Arguments:
+#   1   Miniconda Download URL
+#
+# ----------------------------------------------------------------------
+download_install_miniconda () {
+  URL="$1"
+  MINICONDA_DOWNLOAD_LOCATION="$HOME/miniconda.sh"
+
+  wget $URL -O $MINICONDA_DOWNLOAD_LOCATION
+
+  singularity_exec "sh $MINICONDA_DOWNLOAD_LOCATION -b -p /ext3/miniconda3"
+
+  rm $MINICONDA_DOWNLOAD_LOCATION
+}
+
+# ----------------------------------------------------------------------
+#
+# ----------------------------------------------------------------------
+singularity_exec () {
+  COMMAND="$1"
+
+  singularity exec --overlay $INSTALL_PATH/$OVERLAY_FILE:rw $OS \
+    /bin/bash -c "$1"
+}
+
+# ----------------------------------------------------------------------
+#
+# ----------------------------------------------------------------------
+create_env_file () {
+  singularity exec --overlay $INSTALL_PATH/$OVERLAY_FILE:rw $OS \
+    /bin/bash -c 'echo "#!/bin/bash" > /ext3/env.sh; \
+    echo "source /ext3/miniconda3/etc/profile.d/conda.sh" >> /ext3/env.sh; \
+    echo "export PATH=/ext3/miniconda3/bin:\$PATH" >> /ext3/env.sh; \
+    echo "export PYTHONPATH=/ext3/miniconda/bin:\$PATH" >> /ext3/env.sh'
+}
+
+# ----------------------------------------------------------------------
+#
+# ----------------------------------------------------------------------
+unzip_overlay () {
+  MENU_TEXT="Unzipping template overlay to $INSTALL_PATH/$OVERLAY_FILE"
+
+  {
+    gunzip -c $SRC_OVERLAY_PATH/$SRC_OVERLAY > $INSTALL_PATH/$OVERLAY_FILE &
+    PID_gunzip=$!
+    for ((i = 0 ; i <= 99 ; i+=3)); do
+      sleep 0.72
+      echo $i
+      if ! ps -p $PID_gunzip > /dev/null; then
+        # if PID_gunzip completes before the progress bar gets to 100 break
+        break
+      fi
+    done
+
+    wait $PID_gunzip
+
+    echo 100
+  } | whiptail --backtitle "$MENU_BACKTITLE" --gauge "$MENU_TEXT" 6 $MENU_WIDTH 0
+}
+
+# ----------------------------------------------------------------------
+#
+# ----------------------------------------------------------------------
+check_if_requirements_file_exists () {
+  MENU_TEXT="Do you have a requirements or freeze file?"
+
+  if (whiptail --backtitle "$MENU_BACKTITLE" --yesno "$MENU_TEXT" 10 $MENU_WIDTH); then
+    get_requirements_file
+  fi
+}
+
+# ----------------------------------------------------------------------
+#
+# ----------------------------------------------------------------------
+get_requirements_file () {
+  if dr_file_select "Please, select a 'yml' file" $HOME "*yml" ; then
+    REQUIREMENTS=$FILE_SELECTED
+  else
+    echo "Cancelled!"
+  fi
+
+  VENV="$(head -n1 $REQUIREMENTS | cut -d " " -f 2)"
+}
+
+# ----------------------------------------------------------------------
+# File selection dialog
+#
+# Arguments
+#   1   Dialog title
+#   2   Source path to list files and directories
+#   3   File mask (by default *)
+#   4   "yes" to allow go back in the file system.
+#
+# Returns
+#   0   if a file was selected and loads the FILE_SELECTED variable
+#       with the selected file.
+#   1   if the user cancels.
+# ----------------------------------------------------------------------
+function dr_file_select
+{
+  local TITLE=${1:-$MSG_INFO_TITLE}
+  local LOCAL_PATH=${2:-$(pwd)}
+  local FILE_MASK=${3:-"*"}
+  local ALLOW_BACK=${4:-no}
+  local FILES=()
+
+  [ "$ALLOW_BACK" != "no" ] && FILES+=(".." "..")
+
+  # First add folders
+  #for DIR in $(find $LOCAL_PATH -maxdepth 1 -mindepth 1 -type d -not -name ".*" -printf "%f " 2> /dev/null)
+  for DIR in $(find $LOCAL_PATH -maxdepth 1 -mindepth 1 -type d -not -name ".*" 2> /dev/null | rev | cut -d/ -f1 | rev | sort )
+  do
+    FILES+=($DIR "folder")
+  done
+
+  # Then add the files
+  for FILE in $(find $LOCAL_PATH -maxdepth 1 -type f -name "$FILE_MASK" -printf "%f %s " 2> /dev/null)
+  do
+    FILES+=($FILE)
+  done
+
+  while true
+  do
+    FILE_SELECTED=$(whiptail --clear --backtitle "$BACK_TITLE" --title "$TITLE" --menu "$LOCAL_PATH" 18 80 10 ${FILES[@]} 3>&1 1>&2 2>&3)
+    if [ -z "$FILE_SELECTED" ]; then
+      return 1
+    else
+      if [ "$FILE_SELECTED" = ".." ] && [ "$ALLOW_BACK" != "no" ]; then
+        return 0
+      elif [ -d "$LOCAL_PATH/$FILE_SELECTED" ] ; then
+        if dr_file_select "$TITLE" "$LOCAL_PATH/$FILE_SELECTED" "$FILE_MASK" "yes" ; then
+          if [ "$FILE_SELECTED" != ".." ]; then
+            return 0
+          fi
+        else
+          return 1
+        fi
+      elif [ -f "$LOCAL_PATH/$FILE_SELECTED" ] ; then
+        FILE_SELECTED="$LOCAL_PATH/$FILE_SELECTED"
+        return 0
+      fi
+    fi
+  done
+}
+
+
+# ----------------------------------------------------------------------
+#
+# ----------------------------------------------------------------------
+check_cancelled () {
+  exitstatus=$?
+  if [ $exitstatus = 1 ]; then
+    echo "Cancelled"
+    exit 1
+  fi
+}
+
+main
+
+echo ""
+echo "-----------------------------------------------------------------------------"
+echo -e "\e[4mTo install into your overlay, run the following:${NC}"
+echo -e "singularity exec --overlay $INSTALL_PATH/$OVERLAY_FILE:rw $OS \\"
+echo -e "  /bin/bash -c \"source /ext3/env.sh; conda install -y <package1> <package2>\""
+echo ""
+echo -e "\e[4mIn order to run in a slurm job be sure to run in readonly (ro):${NC}"
+echo -e "singularity exec --overlay $INSTALL_PATH/$OVERLAY_FILE:rw $OS \\"
+echo -e "  /bin/bash -c \"source /ext3/env.sh; <command>\""
+echo ""
+echo -e "\e[4mEXAMPLE 1: running a python script${NC}"
+echo -e "singularity exec --overlay $INSTALL_PATH/$OVERLAY_FILE:ro $OS \\"
+echo -e "  /bin/bash -c \"source /ext3/env.sh; python script.py <args>\""
+echo ""
+echo -e "For more information check out https://hpc.nyu.edu or email hpc@nyu.edu"
+echo "-----------------------------------------------------------------------------"
